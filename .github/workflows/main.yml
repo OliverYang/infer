@@ -1,0 +1,129 @@
+name: Build Infer on Linux (x86_64 and ARM64)
+
+on:
+  push:
+    branches:
+      - main
+  pull_request:
+    branches:
+      - main
+  workflow_dispatch:
+
+jobs:
+  build:
+    name: Build Infer
+    runs-on: ubuntu-latest
+    strategy:
+      fail-fast: false
+      matrix:
+        platform:
+          - "x86_64"
+          - "arm64"
+
+    steps:
+      - name: Checkout code
+        uses: actions/checkout@v4
+
+      - name: Set up QEMU
+        if: matrix.platform.name == 'arm64'
+        uses: docker/setup-qemu-action@v3
+        with:
+          platforms: arm64
+
+      - name: Set up Docker Buildx
+        uses: docker/setup-buildx-action@v3
+
+      - name: Install Required Apt Packages for Ubuntu
+        if: matrix.platform.name == 'x86_64'
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y \
+            clang libmpfr-dev libsqlite3-dev ninja-build \
+            build-essential curl libgmp-dev m4 pkg-config zlib1g-dev python3 cmake
+          sudo apt-get clean
+
+      - name: Setup Java SDK
+        uses: actions/setup-java@v3
+        with:
+          distribution: 'temurin'
+          java-version: '11'
+
+      - name: Setup Python
+        uses: actions/setup-python@v4
+        with:
+          python-version: '3.10'
+
+      - name: Use OCaml 5.2.1+flambda
+        uses: ocaml/setup-ocaml@v3
+        with:
+          ocaml-compiler: ocaml-variants.5.2.1+options,ocaml-option-flambda
+
+      - name: Compute hash of clang installation
+        id: clang-hash
+        run: |
+          echo "value=$(./facebook-clang-plugins/clang/setup.sh --clang-hash)" >> $GITHUB_OUTPUT
+
+      - name: Attempt to get clang from the cache
+        id: cache-clang
+        uses: actions/cache@v4
+        with:
+          path: facebook-clang-plugins/clang/install
+          key: clang-${{ matrix.platform.name }}-${{ steps.clang-hash.outputs.value }}
+
+      - name: Record that the clang cache was hit
+        if: steps.cache-clang.outputs.cache-hit == 'true'
+        run: ./facebook-clang-plugins/clang/setup.sh --only-record-install
+
+      - name: Build clang on cache misses
+        if: steps.cache-clang.outputs.cache-hit != 'true'
+        run: |
+          ./facebook-clang-plugins/clang/src/prepare_clang_src.sh
+          CC=clang CXX=clang++ ./facebook-clang-plugins/clang/setup.sh --ninja --sequential-link
+
+      - name: Build Infer
+        run: |
+          if [ "${{ matrix.platform.name }}" == "x86_64" ]; then
+            ./build-infer.sh --yes --user-opam-switch
+          else
+            docker run --rm --platform ${{ matrix.platform.arch }} \
+              -v $(pwd):/infer -w /infer \
+              ubuntu:22.04 /bin/bash -c "
+                apt-get update && \
+                apt-get install -y clang libmpfr-dev libsqlite3-dev ninja-build \
+                  build-essential curl libgmp-dev m4 pkg-config zlib1g-dev python3 cmake opam && \
+                opam init --disable-sandboxing -y && \
+                eval \$(opam env) && \
+                opam update && \
+                opam switch create 5.2.1+flambda && \
+                eval \$(opam env) && \
+                ./build-infer.sh --yes --user-opam-switch"
+          fi
+
+      - name: Install ocamlformat
+        run: |
+          opam install --deps-only --locked opam/ocamlformat.opam.locked
+          opam install ocamlformat.$(grep -e '^version:' ./opam/ocamlformat.opam.locked | cut -d ' ' -f 2 | tr -d \")
+          opam exec -- ocamlformat --version
+
+      - name: Install Infer
+        run: |
+          sudo make install BUILD_MODE=opt
+          sudo chown -R $USER: .
+
+      - name: Build release tarball
+        id: build-release
+        run: |
+          ./scripts/create_binary_release.sh "v$(date +%Y%m%d)-${{ matrix.platform.name }}"
+          echo "tarball-path=infer-linux-${{ matrix.platform.name }}-v$(date +%Y%m%d).tar.xz" >> $GITHUB_OUTPUT
+
+      - name: Upload Artifact
+        uses: actions/upload-artifact@v4
+        with:
+          name: infer-${{ matrix.platform.name }}
+          path: ${{ steps.build-release.outputs.tarball-path }}
+          retention-days: 7 
+
+      - name: Print Artifact Download Info
+        run: |
+          echo "Infer for ${{ matrix.platform.name }} has been uploaded as an artifact."
+          echo "Check the 'Actions' tab to download '${{ steps.build-release.outputs.tarball-path }}'."
