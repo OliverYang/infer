@@ -1,0 +1,127 @@
+name: build
+
+on:
+  - push
+  - pull_request
+  workflow_dispatch:   
+
+jobs:
+  build:
+    name: Build Infer (ARM64)
+    runs-on: ubuntu-latest
+    strategy:
+      fail-fast: false
+      matrix:
+        ocaml-compiler:
+          - ocaml-variants.5.2.1+options,ocaml-option-flambda
+
+    steps:
+       
+      - name: Checkout code
+        uses: actions/checkout@v2
+
+       
+      - name: Set up QEMU
+        uses: docker/setup-qemu-action@v3
+        with:
+          platforms: arm64
+
+       
+      - name: Set up Docker Buildx
+        uses: docker/setup-buildx-action@v3
+
+       
+      - name: Setup Java SDK
+        uses: actions/setup-java@v3
+        with:
+          distribution: 'temurin'
+          java-version: '11'
+
+       
+      - name: Setup Python
+        uses: actions/setup-python@v4
+        with:
+          python-version: '3.10'
+
+       
+      - name: Use OCaml ${{ matrix.ocaml-compiler }}
+        uses: ocaml/setup-ocaml@v3
+        with:
+          ocaml-compiler: ${{ matrix.ocaml-compiler }}
+
+       
+      - name: Compute hash of clang installation
+        id: clang-hash
+        run: |
+          echo "value=$(./facebook-clang-plugins/clang/setup.sh --clang-hash)" >> $GITHUB_OUTPUT
+
+       
+      - name: Attempt to get clang from the cache
+        id: cache-clang
+        uses: actions/cache@v4
+        with:
+          path: facebook-clang-plugins/clang/install
+          key: clang-linux-arm64-${{ steps.clang-hash.outputs.value }}
+
+       
+      - name: Record that the clang cache was hit
+        if: steps.cache-clang.outputs.cache-hit == 'true'
+        run: ./facebook-clang-plugins/clang/setup.sh --only-record-install
+
+       
+      - name: Build clang on cache misses
+        if: steps.cache-clang.outputs.cache-hit != 'true'
+        run: |
+          ./facebook-clang-plugins/clang/src/prepare_clang_src.sh
+          CC=clang CXX=clang++ ./facebook-clang-plugins/clang/setup.sh --ninja --sequential-link
+
+       
+      - name: Build Infer
+        run: |
+          docker run --rm --platform linux/arm64 \
+            -v $(pwd):/infer -w /infer \
+            ubuntu:22.04 /bin/bash -c "
+              apt-get update && \
+              apt-get install -y clang libmpfr-dev libsqlite3-dev ninja-build \
+                build-essential curl libgmp-dev m4 pkg-config zlib1g-dev python3 cmake opam && \
+              opam init --disable-sandboxing -y && \
+              eval \$(opam env) && \
+              opam update && \
+              opam switch create 5.2.1+flambda && \
+              eval \$(opam env) && \
+              ./build-infer.sh --yes --user-opam-switch"
+
+       
+      - name: Install ocamlformat
+        run: |
+          opam install --deps-only --locked opam/ocamlformat.opam.locked
+          opam install ocamlformat.$(grep -e '^version:' ./opam/ocamlformat.opam.locked | cut -d ' ' -f 2 | tr -d \")
+          opam exec -- ocamlformat --version
+
+       
+      - name: Install Infer
+        run: |
+          sudo make install BUILD_MODE=opt
+          sudo chown -R $USER: .
+
+       
+      - name: Build release tarball
+        id: build-release
+        run: |
+          VERSION="v$(date +%Y%m%d)-arm64"
+          ./scripts/create_binary_release.sh "$VERSION"
+          echo "tarball-path=infer-linux-arm64-$VERSION.tar.xz" >> $GITHUB_OUTPUT
+
+       
+      - name: Upload Artifact
+        uses: actions/upload-artifact@v4
+        with:
+          name: infer-linux-arm64
+          path: ${{ steps.build-release.outputs.tarball-path }}
+          retention-days: 7   
+
+       
+      - name: Print Artifact Download Info
+        run: |
+          echo "Infer for ARM64 has been uploaded as an artifact."
+          echo "Check the 'Actions' tab to download '${{ steps.build-release.outputs.tarball-path }}'."
